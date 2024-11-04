@@ -1,7 +1,9 @@
 #include <Adafruit_CharacterOLED.h>
+#include <sysex.hpp>
 #include <Bounce2.h>
 #include <limits.h>
 #include <string.h>
+#include <stdio.h>
 
 #define GLYPH_QUAVER    "\x01"
 #define GLYPH_ENTER     "\x02"
@@ -12,21 +14,6 @@
 #define GLYPH_THIRD     "\x07"
 #define GLYPH_QUARTER   "\x08"
 #define GLYPH_FIFTH     "\x09"
-
-enum AntonijnSysexEvent {
-	TRANSPOSE    = 0x01,
-	TEMPERAMENT  = 0x02,
-	TUNING       = 0x03,
-
-	INSTRUMENT   = 0x04,
-
-	GRANDORUGE_READY = 0x100,
-	GRANDORGUE_GAIN = 0x101,
-	GRANDORGUE_POLYPHONY = 0x102,
-
-	GRANDORGUE_START_RECORDING = 0x141,
-	GRANDORGUE_STOP_RECORDING = 0x142,
-};
 
 static void int_bytes_network_order(uint8_t *dest, int16_t value)
 {
@@ -42,14 +29,14 @@ static void int_bytes_network_order(uint8_t *dest, int16_t value)
 		dest[i] = (bytes[i] < 10) ? ('0' + bytes[i]) : ('A' + (bytes[i] - 10));
 }
 
-static void sendAntonijnSysEx(enum AntonijnSysexEvent event, int value)
-{
-	static const uint8_t prefix[] = { 'J', 'O', 'H', 'A', 'N', 'N', 'U', 'S', 'A', 'N', 'T', 'O', 'N', 'I', 'J', 'N' };
+static const uint8_t johannusAntonijnPrefix[] = { 'J', 'O', 'H', 'A', 'N', 'N', 'U', 'S', 'A', 'N', 'T', 'O', 'N', 'I', 'J', 'N' };
 
-	uint8_t message[sizeof(prefix) + 4 + 4];
-	memcpy(message, prefix, sizeof(prefix));
-	int_bytes_network_order(message + sizeof(prefix), (int)event);
-	int_bytes_network_order(message + sizeof(prefix) + 4, value);
+static void sendAntonijnSysEx(clavier::johannus_antonijn_sysex_event event, int value)
+{
+	uint8_t message[sizeof(johannusAntonijnPrefix) + 4 + 4];
+	memcpy(message, johannusAntonijnPrefix, sizeof(johannusAntonijnPrefix));
+	int_bytes_network_order(message + sizeof(johannusAntonijnPrefix), (int)event);
+	int_bytes_network_order(message + sizeof(johannusAntonijnPrefix) + 4, value);
 	usbMIDI.sendSysEx(sizeof(message), message, false);
 }
 
@@ -80,6 +67,18 @@ static int nlog10(int n)
 
 	return 1 + nlog10(n / 10);
 }
+
+enum display_state {
+	WAITING,
+	AWAKE,
+	ASLEEP
+};
+
+static display_state state = WAITING;
+static unsigned long last_press = 0UL;
+
+static void update_display_state(display_state new_state);
+static void handle_sysex(uint8_t *sysExData, unsigned length);
 
 class SubMenu;
 
@@ -227,9 +226,9 @@ public:
 		if (active_) {
 			if (value_ > min_) {
 				--value_;
+				show();
 				if (change_callback != nullptr)
 					change_callback(value_);
-				show();
 			}
 		} else {
 			Screen::left(screen);
@@ -240,9 +239,9 @@ public:
 		if (active_) {
 			if (value_ < max_) {
 				++value_;
+				show();
 				if (change_callback != nullptr)
 					change_callback(value_);
-				show();
 			}
 		} else {
 			Screen::right(screen);
@@ -351,7 +350,7 @@ public:
 	{
 		if (recording) {
 			recording = false;
-			sendAntonijnSysEx(GRANDORGUE_STOP_RECORDING, 0);
+			sendAntonijnSysEx(clavier::GRANDORGUE_STOP_RECORDING, 0);
 			show();
 		} else {
 			Screen::up(screen);
@@ -362,7 +361,7 @@ public:
 	{
 		if (!recording) {
 			recording = true;
-			sendAntonijnSysEx(GRANDORGUE_START_RECORDING, 0);
+			sendAntonijnSysEx(clavier::GRANDORGUE_START_RECORDING, 0);
 			show();
 		}
 	}
@@ -458,9 +457,46 @@ static button buttons[NUM_BUTTONS];
 
 static Screen *active_screen;
 static SubMenu technical_opts;
-static SimpleIntOption transpose, tuning, gain, polyphony;
+static SimpleIntOption transpose, gain, polyphony;
 static StringIntOption instrument, temperament;
 static RecordingOption recorder;
+
+static void handle_sysex(uint8_t *sysExData, unsigned length)
+{
+	clavier::johannus_antonijn_sysex_event key;
+	int value;
+	if (clavier::parse_johannus_antonijn_sysex(sysExData, length, key, value)
+	 && key == clavier::GRANDORGUE_READY)
+	{
+		update_display_state(AWAKE);
+	}
+}
+
+static void update_display_state(display_state new_state)
+{
+	if (state == WAITING)
+		usbMIDI.setHandleSystemExclusive((void (*)(uint8_t *, unsigned))NULL);
+
+	switch (new_state) {
+	case WAITING:
+		oled.clear();
+		oled.setCursor(0, 0);
+		oled.print("Loading...");
+		usbMIDI.setHandleSystemExclusive(handle_sysex);
+		break;
+
+	case AWAKE:
+		active_screen->show();
+		last_press = millis();
+		break;
+
+	case ASLEEP:
+		oled.clear();
+		break;
+	}
+
+	state = new_state;
+}
 
 void setup()
 {
@@ -582,16 +618,12 @@ void setup()
 	const auto num_instrs = sizeof(instr_strings) / sizeof(instr_strings[0]);
 	instrument.init("Instrument", instr_strings, num_instrs);
 	instrument.set_callback([](int i) {
-		sendAntonijnSysEx(INSTRUMENT, i);
+		update_display_state(WAITING);
+		sendAntonijnSysEx(clavier::INSTRUMENT, i);
 	});
 	transpose.init("Transpose", 0, -11, 11);
 	transpose.set_callback([](int t) {
-		sendAntonijnSysEx(TRANSPOSE, t);
-	});
-	tuning.init("Tuning", 440, 415, 480);
-	tuning.postfix = "Hz";
-	tuning.set_callback([](int t) {
-		sendAntonijnSysEx(TUNING, t);
+		sendAntonijnSysEx(clavier::TRANSPOSE, t);
 	});
 
 	static const char *tmpnt_strings[] = {
@@ -599,40 +631,43 @@ void setup()
 		"Equal",
 		"Kirnberger",
 		"Werckmeister",
-		"Bach/Lehman",
 		"1/4 Meantone",
 		"1/5 Meantone",
 		"1/6 Meantone",
 		"2/7 Meantone",
+		"1/3 Meantone",
 		"Pythagorean",
+		"Pythag. B-F#",
+		"Bach/Lehman",
+		"Bach/Donnell",
 	};
 	const auto num_temps = sizeof(tmpnt_strings) / sizeof(tmpnt_strings[0]);
 	temperament.init("Temperament", tmpnt_strings, num_temps);
 	temperament.set_callback([](int t) {
-		sendAntonijnSysEx(TEMPERAMENT, t);
+		sendAntonijnSysEx(clavier::TEMPERAMENT, t);
 	});
 	gain.init("Gain", -15, -30, 10);
 	gain.postfix = "dB";
 	gain.set_callback([](int g) {
-		sendAntonijnSysEx(GRANDORGUE_GAIN, g);
+		sendAntonijnSysEx(clavier::GRANDORGUE_GAIN, g);
 	});
 	polyphony.init("Polyphony", 25, 5, 50);
 	polyphony.power_of_10 = 2;
 	polyphony.set_callback([](int poly) {
-		sendAntonijnSysEx(GRANDORGUE_POLYPHONY, poly);
+		sendAntonijnSysEx(clavier::GRANDORGUE_POLYPHONY, poly);
 	});
 
 	instrument.right_of(technical_opts);
 	transpose.right_of(instrument);
 	temperament.right_of(transpose);
-	tuning.right_of(temperament);
-	recorder.right_of(tuning);
+	recorder.right_of(temperament);
 
 	gain.place_in(technical_opts);
 	polyphony.right_of(gain);
 
 	active_screen = &instrument;
-	active_screen->show();
+
+	update_display_state(WAITING);
 }
 
 static bool button_rose(int btn)
@@ -648,32 +683,38 @@ void loop()
 	auto left = button_rose(LEFT);
 	auto right = button_rose(RIGHT);
 
-	static auto last_press = 0UL;
-	auto time = millis();
+	if (state == WAITING) {
+		usbMIDI.read();
+		return;
+	}
 
-	static auto previously_timed_out = false;
+	auto time = millis();
 
 	if (up | down | left | right)
 		last_press = time;
 
 	auto timed_out = time - last_press > 2ul * 60ul * 1000ul;
 
-	if (!timed_out) {
-		if (previously_timed_out) {
-			active_screen->show();
-		} else {
-			if (up)
-				active_screen->up(active_screen);
-			else if (down)
-				active_screen->down(active_screen);
-			else if (left)
-				active_screen->left(active_screen);
-			else if (right)
-				active_screen->right(active_screen);
-		}
-	} else if (!previously_timed_out) {
-		oled.clear();
-	}
+	switch (state) {
+	case ASLEEP:
+		if (!timed_out)
+			update_display_state(AWAKE);
+		break;
 
-	previously_timed_out = timed_out;
+	case AWAKE:
+		if (timed_out) {
+			update_display_state(ASLEEP);
+			break;
+		}
+
+		if (up)
+			active_screen->up(active_screen);
+		else if (down)
+			active_screen->down(active_screen);
+		else if (left)
+			active_screen->left(active_screen);
+		else if (right)
+			active_screen->right(active_screen);
+		break;
+	}
 }
